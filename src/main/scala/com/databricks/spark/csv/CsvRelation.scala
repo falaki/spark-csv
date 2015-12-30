@@ -15,43 +15,58 @@
  */
 package com.databricks.spark.csv
 
-import java.io.IOException
-
 import scala.collection.JavaConversions._
 import scala.util.control.NonFatal
 
+import com.google.common.base.Objects
 import org.apache.commons.csv._
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.FileStatus
 import org.slf4j.LoggerFactory
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql._
-import org.apache.spark.sql.sources.{PrunedScan, BaseRelation, InsertableRelation, TableScan}
+import org.apache.spark.sql.sources._
+import org.apache.hadoop.mapreduce.{TaskAttemptContext, Job}
 import org.apache.spark.sql.types._
+
 import com.databricks.spark.csv.readers.{BulkCsvReader, LineCsvReader}
 import com.databricks.spark.csv.util._
 
-case class CsvRelation protected[spark] (
-    baseRDD: () => RDD[String],
-    location: Option[String],
-    useHeader: Boolean,
-    delimiter: Char,
-    quote: Character,
-    escape: Character,
-    comment: Character,
-    parseMode: String,
-    parserLib: String,
-    ignoreLeadingWhiteSpace: Boolean,
-    ignoreTrailingWhiteSpace: Boolean,
-    treatEmptyValuesAsNulls: Boolean,
-    userSchema: StructType = null,
-    inferCsvSchema: Boolean,
-    codec: String = null)(@transient val sqlContext: SQLContext)
-  extends BaseRelation with TableScan with PrunedScan with InsertableRelation {
+private[csv] case class CsvRelation(
+    private val inputRDD: Option[RDD[String]],
+    override val paths: Array[String],
+    private val maybeDataSchema: Option[StructType],
+    override val userDefinedPartitionColumns: Option[StructType],
+    private val parameters: Map[String, String])
+    (@transient val sqlContext: SQLContext) extends HadoopFsRelation {
 
-  /**
-   * Limit the number of lines we'll search for a header row that isn't comment-prefixed.
-   */
+
+  override def dataSchema: StructType = maybeDataSchema match {
+    case Some(structType) => structType
+    case None => inferSchema(paths)
+  }
+
+  @transient
+  private val params = new Parameters(parameters)
+
+  private val delimiter = TypeCast.toChar(parameters.getOrElse("delimiter", ","))
+  private val parserLib = parameters.getOrElse("parserLib", ParserLibs.DEFAULT)
+  private val parseMode = parameters.getOrElse("mode", "PERMISSIVE")
+  private val charset = parameters.getOrElse("charset", TextFile.DEFAULT_CHARSET.name())
+  // TODO validate charset?
+  val codec = parameters.getOrElse("codec", null)
+
+  private val quote = params.getChar("quote", Some('\"'))
+  private val escape = params.getChar("escape", Some('\\'))
+  private val comment = params.getChar("comment", None)
+
+  private val headerFlag = params.getBool("header")
+  private val inferSchemaFlag = params.getBool("inferSchema")
+  private val treatEmptyValuesAsNullsFlag = params.getBool("treatEmptyValuesAsNulls")
+  private val ignoreLeadingWhiteSpaceFlag = params.getBool("ignoreLeadingWhiteSpace")
+  private val ignoreTrailingWhiteSpaceFlag = params.getBool("ignoreTrailingWhiteSpace")
+
+  // Limit the number of lines we'll search for a header row that isn't comment-prefixed
   private val MAX_COMMENT_LINES_IN_HEADER = 10
 
   private val logger = LoggerFactory.getLogger(CsvRelation.getClass)
@@ -61,7 +76,8 @@ case class CsvRelation protected[spark] (
     logger.warn(s"$parseMode is not a valid parse mode. Using ${ParseModes.DEFAULT}.")
   }
 
-  if ((ignoreLeadingWhiteSpace || ignoreLeadingWhiteSpace) && ParserLibs.isCommonsLib(parserLib)) {
+  if ((ignoreLeadingWhiteSpaceFlag || ignoreTrailingWhiteSpaceFlag) &&
+    ParserLibs.isCommonsLib(parserLib)) {
     logger.warn(s"Ignore white space options may not work with Commons parserLib option")
   }
 
@@ -69,85 +85,46 @@ case class CsvRelation protected[spark] (
   private val dropMalformed = ParseModes.isDropMalformedMode(parseMode)
   private val permissive = ParseModes.isPermissiveMode(parseMode)
 
-  override val schema: StructType = inferSchema()
+  @transient
+  private var cachedRDD: Option[RDD[String]] = None
 
-  private def tokenRdd(header: Array[String]): RDD[Array[String]] = {
+  private def baseRDD(inputPaths: Array[String]): RDD[String] = {
+    inputRDD.getOrElse {
+      cachedRDD.getOrElse {
+        println("******************")
+        println("Reading base RDD from paths: " + inputPaths.mkString(","))
+        // println(Thread.currentThread().getStackTrace().toSeq.mkString("\n"))
+        val rdd = TextFile.withCharset(sqlContext.sparkContext, inputPaths.mkString(","), charset)
+        println(s"Read the RDD with ${rdd.count} rows")
+        cachedRDD = Some(rdd)
+        rdd
+      }
+    }
+  }
+
+  private def tokenRdd(header: Array[String], inputPaths: Array[String]): RDD[Array[String]] = {
+    println("Calling baseRDD function in tokenRdd() function")
+    val rdd = baseRDD(inputPaths)
+    // Make sure firstLine is materialized before sending to executors
+    val firstLine = if (headerFlag) findFirstLine(rdd) else null
+    sqlContext.sparkContext.emptyRDD[Array[String]]
 
     if (ParserLibs.isUnivocityLib(parserLib)) {
-      univocityParseCSV(baseRDD(), header)
+      univocityParseCSV(rdd, header, firstLine)
     } else {
-      val csvFormat = defaultCsvFormat
-        .withDelimiter(delimiter)
-        .withQuote(quote)
-        .withEscape(escape)
-        .withSkipHeaderRecord(false)
-        .withHeader(header: _*)
-        .withCommentMarker(comment)
-
-      // If header is set, make sure firstLine is materialized before sending to executors.
-      val filterLine = if (useHeader) firstLine else null
-
-      baseRDD().mapPartitions { iter =>
-        // When using header, any input line that equals firstLine is assumed to be header
-        val csvIter = if (useHeader) {
-          iter.filter(_ != filterLine)
-        } else {
-          iter
-        }
-        parseCSV(csvIter, csvFormat)
+      parseCSV(rdd, header, firstLine)
       }
-    }
   }
-
-  override def buildScan: RDD[Row] = {
-    val schemaFields = schema.fields
-    tokenRdd(schemaFields.map(_.name)).flatMap { tokens =>
-
-      if (dropMalformed && schemaFields.length != tokens.size) {
-        logger.warn(s"Dropping malformed line: ${tokens.mkString(",")}")
-        None
-      } else if (failFast && schemaFields.length != tokens.size) {
-        throw new RuntimeException(s"Malformed line in FAILFAST mode: ${tokens.mkString(",")}")
-      } else {
-        var index: Int = 0
-        val rowArray = new Array[Any](schemaFields.length)
-        try {
-          index = 0
-          while (index < schemaFields.length) {
-            val field = schemaFields(index)
-            rowArray(index) = TypeCast.castTo(tokens(index), field.dataType, field.nullable,
-              treatEmptyValuesAsNulls)
-            index = index + 1
-          }
-          Some(Row.fromSeq(rowArray))
-        } catch {
-          case aiob: ArrayIndexOutOfBoundsException if permissive =>
-            (index until schemaFields.length).foreach(ind => rowArray(ind) = null)
-            Some(Row.fromSeq(rowArray))
-          case nfe: java.lang.NumberFormatException if dropMalformed =>
-            logger.warn("Number format exception. " +
-              s"Dropping malformed line: ${tokens.mkString(",")}")
-            None
-          case pe: java.text.ParseException if dropMalformed =>
-            logger.warn("Parse Exception. " +
-              s"Dropping malformed line: ${tokens.mkString(",")}")
-            None
-        }
-      }
-    }
-  }
-
 
   /**
-   * This supports to eliminate unneeded columns before producing an RDD
-   * containing all of its tuples as Row objects. This reads all the tokens of each line
-   * and then drop unneeded tokens without casting and type-checking by mapping
-   * both the indices produced by `requiredColumns` and the ones of tokens.
-   */
-  override def buildScan(requiredColumns: Array[String]): RDD[Row] = {
+    * This supports to eliminate unneeded columns before producing an RDD
+    * containing all of its tuples as Row objects. This reads all the tokens of each line
+    * and then drop unneeded tokens without casting and type-checking by mapping
+    * both the indices produced by `requiredColumns` and the ones of tokens.
+    */
+  override def buildScan(requiredColumns: Array[String], inputs: Array[FileStatus]): RDD[Row] = {
     val schemaFields = schema.fields
     val requiredFields = StructType(requiredColumns.map(schema(_))).fields
-    val shouldTableScan = schemaFields.deep == requiredFields.deep
     val safeRequiredFields = if (dropMalformed) {
       // If `dropMalformed` is enabled, then it needs to parse all the values
       // so that we can decide which row is malformed.
@@ -155,8 +132,8 @@ case class CsvRelation protected[spark] (
     } else {
       requiredFields
     }
-    if (shouldTableScan) {
-      buildScan
+    if (requiredColumns.isEmpty) {
+      sqlContext.sparkContext.emptyRDD[Row]
     } else {
       val safeRequiredIndices = new Array[Int](safeRequiredFields.length)
       schemaFields.zipWithIndex.filter {
@@ -166,7 +143,12 @@ case class CsvRelation protected[spark] (
       }
       val rowArray = new Array[Any](safeRequiredIndices.length)
       val requiredSize = requiredFields.length
-      tokenRdd(schemaFields.map(_.name)).flatMap { tokens =>
+      val pathsString = inputs.map(_.getPath.toUri.toString)
+      println("////////////////////////////////////////")
+      println("Before going into flatMap")
+      val header = schemaFields.map(_.name)
+      tokenRdd(header, pathsString).flatMap { tokens =>
+        println("tokens are: " + tokens)
         if (dropMalformed && schemaFields.length != tokens.size) {
           logger.warn(s"Dropping malformed line: ${tokens.mkString(delimiter.toString)}")
           None
@@ -189,7 +171,7 @@ case class CsvRelation protected[spark] (
                 indexSafeTokens(index),
                 field.dataType,
                 field.nullable,
-                treatEmptyValuesAsNulls)
+                treatEmptyValuesAsNullsFlag)
               subIndex = subIndex + 1
             }
             Some(Row.fromSeq(rowArray.take(requiredSize)))
@@ -208,53 +190,76 @@ case class CsvRelation protected[spark] (
     }
   }
 
-  private def inferSchema(): StructType = {
-    if (this.userSchema != null) {
-      userSchema
-    } else {
-      val firstRow = if (ParserLibs.isUnivocityLib(parserLib)) {
-        val escapeVal = if (escape == null) '\\' else escape.charValue()
-        val commentChar: Char = if (comment == null) '\0' else comment
-        val quoteChar: Char = if (quote == null) '\0' else quote
-        new LineCsvReader(
-          fieldSep = delimiter,
-          quote = quoteChar,
-          escape = escapeVal,
-          commentMarker = commentChar).parseLine(firstLine)
-      } else {
-        val csvFormat = defaultCsvFormat
-          .withDelimiter(delimiter)
-          .withQuote(quote)
-          .withEscape(escape)
-          .withSkipHeaderRecord(false)
-        CSVParser.parse(firstLine, csvFormat).getRecords.head.toArray
-      }
-      val header = if (useHeader) {
-        firstRow
-      } else {
-        firstRow.zipWithIndex.map { case (value, index) => s"C$index"}
-      }
-      if (this.inferCsvSchema) {
-        InferSchema(tokenRdd(header), header)
-      } else {
-        // By default fields are assumed to be StringType
-        val schemaFields = header.map { fieldName =>
-          StructField(fieldName.toString, StringType, nullable = true)
-        }
-        StructType(schemaFields)
+  override def prepareJobForWrite(job: Job): OutputWriterFactory = {
+    new OutputWriterFactory {
+      override def newInstance(
+          path: String,
+          dataSchema: StructType,
+          context: TaskAttemptContext): OutputWriter =  {
+        new CsvOutputWriter(path, dataSchema, context, parameters)
       }
     }
   }
 
-  /**
-   * Returns the first line of the first non-empty file in path
-   */
-  private lazy val firstLine = {
-    if (comment == null) {
-      baseRDD().first()
+  override def hashCode(): Int = Objects.hashCode(paths.toSet, dataSchema, schema, partitionColumns)
+
+  override def equals(other: Any): Boolean = other match {
+    case that: CsvRelation => {
+      val equalPath = paths.toSet == that.paths.toSet
+      val equalDataSchema = dataSchema == that.dataSchema
+      val equalSchema = schema == that.schema
+      val equalPartitionColums = partitionColumns == that.partitionColumns
+
+      equalPath && equalDataSchema && equalSchema && equalPartitionColums
+    }
+    case _ => false
+  }
+
+  private def inferSchema(paths: Array[String]): StructType = {
+    println("Infer schema is called")
+    val rdd = baseRDD(Array(paths.head))
+    val firstLine = findFirstLine(rdd)
+    val firstRow = if (ParserLibs.isUnivocityLib(parserLib)) {
+      new LineCsvReader(
+        fieldSep = delimiter,
+        quote = quote.getOrElse('\0'),
+        escape = escape.getOrElse('\0'),
+        commentMarker = comment.getOrElse('\0')).parseLine(firstLine)
     } else {
-      baseRDD().take(MAX_COMMENT_LINES_IN_HEADER)
-        .find(! _.startsWith(comment.toString))
+      val csvFormat = defaultCsvFormat
+        .withDelimiter(delimiter)
+        .withQuote(quote.get)
+        .withEscape(escape.get)
+        .withSkipHeaderRecord(false)
+      CSVParser.parse(firstLine, csvFormat).getRecords.head.toArray
+    }
+    val header = if (headerFlag) {
+      firstRow
+    } else {
+      firstRow.zipWithIndex.map { case (value, index) => s"C$index" }
+    }
+
+    val parsedRdd = tokenRdd(header, paths)
+    if (inferSchemaFlag) {
+      InferSchema(parsedRdd, header)
+    } else {
+      // By default fields are assumed to be StringType
+      val schemaFields = header.map { fieldName =>
+        StructField(fieldName.toString, StringType, nullable = true)
+      }
+      StructType(schemaFields)
+    }
+  }
+
+  /**
+    * Returns the first line of the first non-empty file in path
+    */
+  private def findFirstLine(rdd: RDD[String]) = {
+    if (comment.isEmpty) {
+      rdd.first()
+    } else {
+      rdd.take(MAX_COMMENT_LINES_IN_HEADER)
+        .find(!_.startsWith(comment.get.toString))
         .getOrElse(sys.error(s"No uncommented header line in " +
           s"first $MAX_COMMENT_LINES_IN_HEADER lines"))
     }
@@ -262,72 +267,54 @@ case class CsvRelation protected[spark] (
 
   private def univocityParseCSV(
      file: RDD[String],
-     header: Seq[String]): RDD[Array[String]] = {
+     header: Seq[String],
+     firstLine: String): RDD[Array[String]] = {
     // If header is set, make sure firstLine is materialized before sending to executors.
-    val filterLine = if (useHeader) firstLine else null
-    val dataLines = if (useHeader) file.filter(_ != filterLine) else file
-    val rows = dataLines.mapPartitionsWithIndex({
-      case (split, iter) => {
-        val escapeVal = if (escape == null) '\\' else escape.charValue()
-        val commentChar: Char = if (comment == null) '\0' else comment
-        val quoteChar: Char = if (quote == null) '\0' else quote
-
-        new BulkCsvReader(iter, split,
-          headers = header, fieldSep = delimiter,
-          quote = quoteChar, escape = escapeVal, commentMarker = commentChar)
-      }
+    println("Univocity parser is working")
+    println("header: " + header)
+    println("firstLine: " + firstLine)
+    file.mapPartitionsWithIndex({
+      case (split, iter) => new BulkCsvReader(
+          if (headerFlag) iter.filterNot(_ == firstLine) else iter,
+          split,
+          headers = header,
+          fieldSep = delimiter,
+          quote = quote.getOrElse('\0'),
+          escape = escape.getOrElse('\0'),
+          commentMarker = comment.getOrElse('\0'))
     }, true)
-
-    rows
   }
 
   private def parseCSV(
-      iter: Iterator[String],
-      csvFormat: CSVFormat): Iterator[Array[String]] = {
-    iter.flatMap { line =>
-      try {
-        val records = CSVParser.parse(line, csvFormat).getRecords
-        if (records.isEmpty) {
-          logger.warn(s"Ignoring empty line: $line")
-          None
-        } else {
-          Some(records.head.toArray)
+      file: RDD[String],
+      header: Seq[String],
+      firstLine: String): RDD[Array[String]] = {
+
+    val csvFormat = defaultCsvFormat
+      .withDelimiter(delimiter)
+      .withQuote(quote.getOrElse('\0'))
+      .withEscape(escape.getOrElse('\0'))
+      .withSkipHeaderRecord(false)
+      .withHeader(header: _*)
+      .withCommentMarker(comment.getOrElse('\0'))
+
+    file.mapPartitions { iter =>
+      val filteredIter = if (headerFlag) iter.filterNot(_ == firstLine) else iter
+      filteredIter.flatMap { line =>
+        try {
+          val records = CSVParser.parse(line, csvFormat).getRecords
+          if (records.isEmpty) {
+            logger.warn(s"Ignoring empty line: $line")
+            None
+          } else {
+            Some(records.head.toArray)
+          }
+        } catch {
+          case NonFatal(e) if !failFast =>
+            logger.error(s"Exception while parsing line: $line. ", e)
+            None
         }
-      } catch {
-        case NonFatal(e) if !failFast =>
-          logger.error(s"Exception while parsing line: $line. ", e)
-          None
       }
-    }
-  }
-
-  // The function below was borrowed from JSONRelation
-  override def insert(data: DataFrame, overwrite: Boolean): Unit = {
-
-    val filesystemPath = location match {
-      case Some(p) => new Path(p)
-      case None =>
-        throw new IOException(s"Cannot INSERT into table with no path defined")
-    }
-
-    val fs = filesystemPath.getFileSystem(sqlContext.sparkContext.hadoopConfiguration)
-
-    if (overwrite) {
-      try {
-        fs.delete(filesystemPath, true)
-      } catch {
-        case e: IOException =>
-          throw new IOException(
-            s"Unable to clear output directory ${filesystemPath.toString} prior"
-              + s" to INSERT OVERWRITE a CSV table:\n${e.toString}")
-      }
-      // Write the data. We assume that schema isn't changed, and we won't update it.
-
-      val codecClass = compresionCodecClass(codec)
-      data.saveAsCsvFile(filesystemPath.toString, Map("delimiter" -> delimiter.toString),
-        codecClass)
-    } else {
-      sys.error("CSV tables only support INSERT OVERWRITE for now.")
     }
   }
 }

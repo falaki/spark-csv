@@ -17,8 +17,8 @@ package com.databricks.spark
 
 import org.apache.commons.csv.CSVFormat
 import org.apache.hadoop.io.compress.CompressionCodec
-
 import org.apache.spark.sql.{DataFrame, SQLContext}
+
 import com.databricks.spark.csv.util.TextFile
 
 package object csv {
@@ -39,34 +39,33 @@ package object csv {
   /**
    * Adds a method, `csvFile`, to SQLContext that allows reading CSV data.
    */
-  implicit class CsvContext(sqlContext: SQLContext) extends Serializable{
+  implicit class CsvContext(sqlContext: SQLContext) extends Serializable {
     def csvFile(
         filePath: String,
         useHeader: Boolean = true,
         delimiter: Char = ',',
         quote: Char = '"',
-        escape: Character = null,
-        comment: Character = null,
+        escape: Character = '\0',
+        comment: Character = '\0',
         mode: String = "PERMISSIVE",
         parserLib: String = "COMMONS",
         ignoreLeadingWhiteSpace: Boolean = false,
         ignoreTrailingWhiteSpace: Boolean = false,
         charset: String = TextFile.DEFAULT_CHARSET.name(),
         inferSchema: Boolean = false): DataFrame = {
-      val csvRelation = CsvRelation(
-        () => TextFile.withCharset(sqlContext.sparkContext, filePath, charset),
-        location = Some(filePath),
-        useHeader = useHeader,
-        delimiter = delimiter,
-        quote = quote,
-        escape = escape,
-        comment = comment,
-        parseMode = mode,
-        parserLib = parserLib,
-        ignoreLeadingWhiteSpace = ignoreLeadingWhiteSpace,
-        ignoreTrailingWhiteSpace = ignoreTrailingWhiteSpace,
-        treatEmptyValuesAsNulls = false,
-        inferCsvSchema = inferSchema)(sqlContext)
+      val parameters = Map(
+        "header" -> useHeader.toString,
+        "delimiter" -> delimiter.toString,
+        "quote" -> quote.toString,
+        "escape" -> escape.toString,
+        "mode" -> mode,
+        "parserLib" -> parserLib,
+        "ignoreLeadingWhiteSpace" -> ignoreLeadingWhiteSpace.toString,
+        "ignoreTrailingWhiteSpace" -> ignoreTrailingWhiteSpace.toString,
+        "charset" -> charset,
+        "inferSchema" -> inferSchema.toString
+      )
+      val csvRelation = CsvRelation(None, Array(filePath), None, None, parameters)(sqlContext)
       sqlContext.baseRelationToDataFrame(csvRelation)
     }
 
@@ -78,20 +77,15 @@ package object csv {
         ignoreTrailingWhiteSpace: Boolean = false,
         charset: String = TextFile.DEFAULT_CHARSET.name(),
         inferSchema: Boolean = false): DataFrame = {
-      val csvRelation = CsvRelation(
-        () => TextFile.withCharset(sqlContext.sparkContext, filePath, charset),
-        location = Some(filePath),
-        useHeader = useHeader,
-        delimiter = '\t',
-        quote = '"',
-        escape = '\\',
-        comment = '#',
-        parseMode = "PERMISSIVE",
-        parserLib = parserLib,
-        ignoreLeadingWhiteSpace = ignoreLeadingWhiteSpace,
-        ignoreTrailingWhiteSpace = ignoreTrailingWhiteSpace,
-        treatEmptyValuesAsNulls = false,
-        inferCsvSchema = inferSchema)(sqlContext)
+      val parameters = Map(
+        "header" -> useHeader.toString,
+        "delimiter" -> "\t",
+        "parserLib" -> parserLib,
+        "ignoreLeadingWhiteSpace" -> ignoreLeadingWhiteSpace.toString,
+        "ignoreTrailingWhiteSpace" -> ignoreTrailingWhiteSpace.toString,
+        "charset" -> charset,
+        "inferSchema" -> inferSchema.toString)
+      val csvRelation = CsvRelation(None, Array(filePath), None, None, parameters)(sqlContext)
       sqlContext.baseRelationToDataFrame(csvRelation)
     }
   }
@@ -104,7 +98,7 @@ package object csv {
      * Note that a codec entry in the parameters map will be ignored.
      */
     def saveAsCsvFile(path: String, parameters: Map[String, String] = Map(),
-                      compressionCodec: Class[_ <: CompressionCodec] = null): Unit = {
+        compressionCodec: Class[_ <: CompressionCodec] = null): Unit = {
       // TODO(hossein): For nested types, we may want to perform special work
       val delimiter = parameters.getOrElse("delimiter", ",")
       val delimiterChar = if (delimiter.length == 1) {

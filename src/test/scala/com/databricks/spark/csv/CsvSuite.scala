@@ -98,6 +98,7 @@ abstract class AbstractCsvSuite extends FunSuite with BeforeAndAfterAll {
          |OPTIONS (path "$carsFile", header "true", parserLib "$parserLib")
       """.stripMargin.replaceAll("\n", " "))
 
+    sqlContext.sql("SELECT * from carsTable").show()
     assert(sqlContext.sql("SELECT year FROM carsTable").collect().size === numCars)
   }
 

@@ -15,10 +15,10 @@
  */
 package com.databricks.spark.csv
 
-
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.sql.types.StructType
+
 import com.databricks.spark.csv.util.{ParserLibs, ParseModes, TextFile}
 
 /**
@@ -114,42 +114,36 @@ class CsvParser extends Serializable {
   /** Returns a Schema RDD for the given CSV path. */
   @throws[RuntimeException]
   def csvFile(sqlContext: SQLContext, path: String): DataFrame = {
-    val relation: CsvRelation = CsvRelation(
-      () => TextFile.withCharset(sqlContext.sparkContext, path, charset),
-      Some(path),
-      useHeader,
-      delimiter,
-      quote,
-      escape,
-      comment,
-      parseMode,
-      parserLib,
-      ignoreLeadingWhiteSpace,
-      ignoreTrailingWhiteSpace,
-      treatEmptyValuesAsNulls,
-      schema,
-      inferSchema,
-      codec)(sqlContext)
+    val parameters = Map(
+      "header" -> useHeader.toString,
+      "delimiter" -> delimiter.toString,
+      "quote" -> quote.toString,
+      "escape" -> escape.toString,
+      "mode" -> parseMode,
+      "parserLib" -> parserLib,
+      "ignoreLeadingWhiteSpace" -> ignoreLeadingWhiteSpace.toString,
+      "ignoreTrailingWhiteSpace" -> ignoreTrailingWhiteSpace.toString,
+      "charset" -> charset,
+      "inferSchema" -> inferSchema.toString
+    )
+    val relation = CsvRelation(None, Array(path), None, None, parameters)(sqlContext)
     sqlContext.baseRelationToDataFrame(relation)
   }
 
   def csvRdd(sqlContext: SQLContext, csvRDD: RDD[String]): DataFrame = {
-    val relation: CsvRelation = CsvRelation(
-      () => csvRDD,
-      None,
-      useHeader,
-      delimiter,
-      quote,
-      escape,
-      comment,
-      parseMode,
-      parserLib,
-      ignoreLeadingWhiteSpace,
-      ignoreTrailingWhiteSpace,
-      treatEmptyValuesAsNulls,
-      schema,
-      inferSchema,
-      codec)(sqlContext)
+    val parameters = Map(
+      "header" -> useHeader.toString,
+      "delimiter" -> delimiter.toString,
+      "quote" -> quote.toString,
+      "escape" -> escape.toString,
+      "mode" -> parseMode,
+      "parserLib" -> parserLib,
+      "ignoreLeadingWhiteSpace" -> ignoreLeadingWhiteSpace.toString,
+      "ignoreTrailingWhiteSpace" -> ignoreTrailingWhiteSpace.toString,
+      "charset" -> charset,
+      "inferSchema" -> inferSchema.toString
+    )
+    val relation = CsvRelation(Some(csvRDD), Array.empty, None, None, parameters)(sqlContext)
     sqlContext.baseRelationToDataFrame(relation)
   }
 }
